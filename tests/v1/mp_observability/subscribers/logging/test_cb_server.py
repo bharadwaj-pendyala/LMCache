@@ -42,6 +42,54 @@ class TestBlendLoggingSubscriber:
         assert EventType.CB_FINGERPRINTS_REGISTERED in subs
         assert EventType.CB_CHUNKS_EVICTED in subs
 
+    def test_subscriptions_cover_v3_sub_phase_events(self, subscriber):
+        subs = subscriber.get_subscriptions()
+        for event_type in (
+            EventType.CB_FINGERPRINT_MATCH_END,
+            EventType.CB_PREFIX_LOOKUP_END,
+            EventType.CB_COORDINATOR_MATCH_END,
+            EventType.CB_SPARSE_PREFETCH_START,
+            EventType.CB_SPARSE_PREFETCH_END,
+            EventType.CB_SCATTER_START,
+            EventType.CB_RETRIEVE_NOOP,
+        ):
+            assert event_type in subs, f"{event_type} is not logged"
+
+    def test_v3_sub_phase_events_log_without_error(self, bus, subscriber):
+        """Handlers read metadata defensively, so a partial payload still logs."""
+        bus.start()
+        for event_type, metadata in [
+            (EventType.CB_FINGERPRINT_MATCH_END, {"matches": 3}),
+            (EventType.CB_PREFIX_LOOKUP_END, {"prefix_chunks": 2}),
+            (EventType.CB_COORDINATOR_MATCH_END, {"matches": 0, "timed_out": True}),
+            (
+                EventType.CB_SPARSE_PREFETCH_START,
+                {"n_chunks": 4, "n_keys": 8, "l2_keys": 6},
+            ),
+            (EventType.CB_SPARSE_PREFETCH_END, {"found_keys": 8, "l2_keys": 6}),
+            (
+                EventType.CB_SCATTER_START,
+                {
+                    "scattered_tokens": 512,
+                    "n_prefix": 1,
+                    "n_shifted": 1,
+                    "dropped": 0,
+                },
+            ),
+            (EventType.CB_RETRIEVE_NOOP, {}),  # partial payload on purpose
+        ]:
+            bus.publish(
+                Event(
+                    event_type=event_type,
+                    session_id="req-v3",
+                    metadata=metadata,
+                )
+            )
+        time.sleep(0.15)
+        bus.stop()
+
+        assert bus.subscriber_exception_counts() == {}
+
     def test_no_subscription_for_lifecycle_sentinels(self, subscriber):
         subs = subscriber.get_subscriptions()
         assert EventType.CB_REQUEST_START not in subs

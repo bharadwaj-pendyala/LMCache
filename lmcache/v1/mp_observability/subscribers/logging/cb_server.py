@@ -14,7 +14,12 @@ logger = init_logger(__name__)
 
 
 class BlendLoggingSubscriber(EventSubscriber):
-    """Logs cache blending (CB) events at debug level."""
+    """Logs cache blending (CB) events at debug level.
+
+    Covers the top-level lookup/retrieve/store events and, for V3, the
+    lookup and retrieve sub-phases (fingerprint match, prefix leg, coordinator
+    match, sparse prefetch, scatter) plus no-op retrieves.
+    """
 
     def get_subscriptions(self) -> dict[EventType, EventCallback]:
         """Return the mapping of event types to handler callbacks."""
@@ -29,6 +34,15 @@ class BlendLoggingSubscriber(EventSubscriber):
             EventType.CB_STORE_FINAL_END: self._on_store_final_end,
             EventType.CB_FINGERPRINTS_REGISTERED: self._on_fingerprints_registered,
             EventType.CB_CHUNKS_EVICTED: self._on_chunks_evicted,
+            # V3 lookup / retrieve sub-phases (END only — the START carries no
+            # payload the log line would add to).
+            EventType.CB_FINGERPRINT_MATCH_END: self._on_fingerprint_match_end,
+            EventType.CB_PREFIX_LOOKUP_END: self._on_prefix_lookup_end,
+            EventType.CB_COORDINATOR_MATCH_END: self._on_coordinator_match_end,
+            EventType.CB_SPARSE_PREFETCH_START: self._on_sparse_prefetch_start,
+            EventType.CB_SPARSE_PREFETCH_END: self._on_sparse_prefetch_end,
+            EventType.CB_SCATTER_START: self._on_scatter_start,
+            EventType.CB_RETRIEVE_NOOP: self._on_retrieve_noop,
         }
 
     def _on_store_pre_start(self, event: Event) -> None:
@@ -116,4 +130,62 @@ class BlendLoggingSubscriber(EventSubscriber):
         logger.debug(
             "CB fingerprint table: evicted %s stale chunks",
             event.metadata.get("num_chunks"),
+        )
+
+    def _on_fingerprint_match_end(self, event: Event) -> None:
+        logger.debug(
+            "CB fingerprint match: session=%s matches=%s",
+            event.session_id,
+            event.metadata.get("matches"),
+        )
+
+    def _on_prefix_lookup_end(self, event: Event) -> None:
+        logger.debug(
+            "CB prefix lookup end: session=%s prefix_chunks=%s",
+            event.session_id,
+            event.metadata.get("prefix_chunks"),
+        )
+
+    def _on_coordinator_match_end(self, event: Event) -> None:
+        logger.debug(
+            "CB coordinator match end: session=%s matches=%s timed_out=%s",
+            event.session_id,
+            event.metadata.get("matches"),
+            event.metadata.get("timed_out"),
+        )
+
+    def _on_sparse_prefetch_start(self, event: Event) -> None:
+        logger.debug(
+            "CB sparse prefetch start: session=%s n_chunks=%s n_keys=%s l2_keys=%s",
+            event.session_id,
+            event.metadata.get("n_chunks"),
+            event.metadata.get("n_keys"),
+            event.metadata.get("l2_keys"),
+        )
+
+    def _on_sparse_prefetch_end(self, event: Event) -> None:
+        logger.debug(
+            "CB sparse prefetch end: session=%s found_keys=%s of l2_keys=%s",
+            event.session_id,
+            event.metadata.get("found_keys"),
+            event.metadata.get("l2_keys"),
+        )
+
+    def _on_scatter_start(self, event: Event) -> None:
+        logger.debug(
+            "CB scatter start: session=%s scattered_tokens=%s"
+            " n_prefix=%s n_shifted=%s dropped=%s",
+            event.session_id,
+            event.metadata.get("scattered_tokens"),
+            event.metadata.get("n_prefix"),
+            event.metadata.get("n_shifted"),
+            event.metadata.get("dropped"),
+        )
+
+    def _on_retrieve_noop(self, event: Event) -> None:
+        logger.debug(
+            "CB retrieve no-op: session=%s reason=%s dropped_matches=%s",
+            event.session_id,
+            event.metadata.get("reason"),
+            event.metadata.get("dropped_matches"),
         )

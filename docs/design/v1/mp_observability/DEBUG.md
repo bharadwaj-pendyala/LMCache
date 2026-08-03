@@ -59,6 +59,46 @@ lmcache_blend_lookup_hit_tokens_total / lmcache_blend_lookup_requested_tokens_to
 
 Reported per CacheBlend lookup (`CB_LOOKUP_END`).
 
+Under V3 the numerator splits into its three disjoint reuse paths, which sum to
+`hit_tokens` — useful when the total looks fine but the speedup does not:
+
+```
+lmcache_blend_lookup_prefix_hit_tokens_total            # contiguous prefix, pure load
+lmcache_blend_lookup_segmented_prefix_hit_tokens_total  # post-gap, same positions
+lmcache_blend_lookup_non_prefix_hit_tokens_total        # cross-context, re-RoPE'd
+```
+
+If all three are 0 while `requested_tokens` grows, check
+`lmcache_blend_lookup_no_gpu_context_errors_total` — a server with no registered
+CB KV cache cannot blend at all.
+
+## CB engaged but was not faster
+
+A retrieve that scatters nothing still returns **success**, so no failure
+counter moves and the request silently falls back to a full recompute.  The only
+signal is:
+
+```
+increase(lmcache_blend_retrieve_noops_total) by (reason)
+```
+
+`reason="already_applied"` is benign (vLLM calls retrieve twice, partial- then
+full-block alloc).  `beyond_slot_bound` is expected once per request for the
+same reason, but a sustained rate with no matching successful retrieve means the
+matches never fit.  `no_object_keys` is never benign.
+
+Then check where the time went, per phase:
+
+```
+histogram_quantile(0.9, lmcache_blend_lookup_duration_milliseconds_bucket)
+histogram_quantile(0.9, lmcache_blend_prefix_lookup_duration_milliseconds_bucket)
+histogram_quantile(0.9, lmcache_blend_sparse_prefetch_duration_milliseconds_bucket)
+histogram_quantile(0.9, lmcache_blend_scatter_duration_milliseconds_bucket)
+```
+
+`lookup_duration` minus its legs is poll-wait — time the scheduler spent
+deferring the request while L2 loaded.
+
 ## Blend L1 vs L2 — *not separable today*
 
 The blend lookup consults L1 (fingerprint table) and L2 (storage

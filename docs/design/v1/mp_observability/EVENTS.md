@@ -250,7 +250,7 @@ request scope and guard GPU callback races.  Published via `EventBus.publish()`
 |---|---|---|---|
 | `CB_REQUEST_START` | *(none)* | — | `BlendEngineV2.cb_lookup_pre_computed` — at request arrival |
 | `CB_STORE_PRE_COMPUTED_SUBMITTED` | `instance_id` | `int` | `BlendEngineV2.cb_store_pre_computed` — before GPU store enqueue |
-| `CB_RETRIEVE_SUBMITTED` | `instance_id` | `int` | `BlendEngineV2.cb_retrieve_pre_computed` — before GPU retrieve enqueue |
+| `CB_RETRIEVE_SUBMITTED` | `instance_id`, `expects_store_final` | `int`, `bool` (default `True`) | `BlendEngineV2.cb_retrieve_pre_computed` **or** `BlendV3Module.cb_retrieve_pre_computed` — before GPU retrieve enqueue.  V3 sends `expects_store_final=False`: it has no post-inference store_final, so the root span closes on the last `CB_RETRIEVE_END` instead of waiting for one |
 | `CB_STORE_FINAL_SUBMITTED` | `instance_id` | `int` | `BlendEngineV2.cb_store_final` — before GPU store enqueue |
 | `CB_REQUEST_END` | *(none)* | — | `BlendEngineV2.cb_lookup_pre_computed` (early return: no matches or no GPU context) **or** `BlendEngineV2.cb_store_final` — after SUBMITTED, before GPU work |
 
@@ -273,3 +273,52 @@ These events use `session_id` on the `Event` dataclass (sourced from
 | `CB_STORE_FINAL_END` | `instance_id`, `num_tokens`, `stored_chunks`, `success` | `int`, `int`, `int`, `bool` |
 | `CB_FINGERPRINTS_REGISTERED` | `num_chunks`, `num_tokens` | `int`, `int` |
 | `CB_CHUNKS_EVICTED` | `num_chunks` | `int` |
+
+Under V3 (`blend_v3.py`) `CB_LOOKUP_END` carries three more hit-token keys —
+`prefix_hit_tokens`, `segmented_prefix_hit_tokens`, `non_prefix_hit_tokens`
+(all `int`) plus `prefix_hits` / `prefix_chunks` (`int`) — and `hit_tokens` is
+their sum, so the hit rate counts both reuse paths.  V3 also reports
+`no_gpu_context=True` when no CB KV-cache layout is registered for
+`(model, world_size)`; unlike V2 it still reports the real `requested_tokens`,
+so such a request lands in the hit-rate denominator as a miss.
+
+`CB_FINGERPRINTS_REGISTERED` is published by V2's store paths and, under V3, by
+the fingerprint-queue drainers once `on_new_token_hashes` has returned — so
+`num_chunks` excludes the chunks the store skipped.  Its `session_id` is the
+enqueuing store's request, which is generally *not* the request that drained
+the queue.
+
+### Blend Server V3 sub-phase events
+
+Published by `blend_v3.py` to bracket the legs of the unified lookup and of the
+retrieve scatter.  All correlate by `session_id`; the scatter pair goes through
+`publish_on_stream` so its timing is GPU-accurate.  See
+`blend_v3_observability.md` for the span tree they build.
+
+| EventType | Metadata keys | Types |
+|---|---|---|
+| `CB_FINGERPRINT_MATCH_START` | *(none)* | — |
+| `CB_FINGERPRINT_MATCH_END` | `matches` | `int` |
+| `CB_PREFIX_LOOKUP_START` | *(none)* | — |
+| `CB_PREFIX_LOOKUP_END` | `prefix_chunks` | `int` |
+| `CB_COORDINATOR_MATCH_START` | *(none)* | — |
+| `CB_COORDINATOR_MATCH_END` | `matches`, `timed_out` | `int`, `bool` |
+| `CB_SPARSE_PREFETCH_START` | `n_chunks`, `world_size`, `n_keys`, `l2_keys` | `int`, `int`, `int`, `int` |
+| `CB_SPARSE_PREFETCH_END` | `found_keys`, `l2_keys` | `int`, `int` |
+| `CB_SCATTER_START` | `scattered_tokens`, `n_prefix`, `n_shifted`, `dropped` | `int`, `int`, `int`, `int` |
+| `CB_SCATTER_END` | `success` | `bool` |
+| `CB_RETRIEVE_NOOP` | `reason`, `dropped_matches` | `str`, `int` |
+
+Notes:
+
+- The fingerprint-match and coordinator-match legs are **mutually exclusive**:
+  with a coordinator configured the fleet directory is the only match source.
+  The coordinator leg is async — START at submit, END on the resolving poll or
+  at its deadline (`timed_out=True`).
+- The sparse-prefetch pair is emitted **only when the prefetch actually reads
+  L2** (`l2_keys > 0`); an all-L1-resident match set does no work worth
+  measuring.
+- `CB_RETRIEVE_NOOP` is a point event: the retrieve returned success without
+  scattering anything, so every match degrades to a full recompute.  `reason` is
+  a fixed code (`already_applied`, `beyond_slot_bound`, `no_object_keys`) and is
+  safe to use as a metric attribute.

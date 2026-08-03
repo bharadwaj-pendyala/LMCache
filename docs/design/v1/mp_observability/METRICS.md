@@ -480,6 +480,9 @@ MP mode `lmcache_mp.` namespace).  On Prometheus, `.` becomes `_` and counters g
 | `lmcache_blend.lookup_requests` | `lmcache_blend_lookup_requests_total` | Counter | `CB_LOOKUP_START` | +1 per event |
 | `lmcache_blend.lookup_requested_tokens` | `lmcache_blend_lookup_requested_tokens_total` | Counter | `CB_LOOKUP_END` | `+requested_tokens` |
 | `lmcache_blend.lookup_hit_tokens` | `lmcache_blend_lookup_hit_tokens_total` | Counter | `CB_LOOKUP_END` | `+hit_tokens` |
+| `lmcache_blend.lookup_prefix_hit_tokens` | `lmcache_blend_lookup_prefix_hit_tokens_total` | Counter | `CB_LOOKUP_END` | `+prefix_hit_tokens` |
+| `lmcache_blend.lookup_segmented_prefix_hit_tokens` | `lmcache_blend_lookup_segmented_prefix_hit_tokens_total` | Counter | `CB_LOOKUP_END` | `+segmented_prefix_hit_tokens` |
+| `lmcache_blend.lookup_non_prefix_hit_tokens` | `lmcache_blend_lookup_non_prefix_hit_tokens_total` | Counter | `CB_LOOKUP_END` | `+non_prefix_hit_tokens` |
 | `lmcache_blend.lookup_fingerprint_hits` | `lmcache_blend_lookup_fingerprint_hits_total` | Counter | `CB_LOOKUP_END` | `+fingerprint_hits` |
 | `lmcache_blend.lookup_storage_hits` | `lmcache_blend_lookup_storage_hits_total` | Counter | `CB_LOOKUP_END` | `+storage_hits` |
 | `lmcache_blend.lookup_stale_chunks` | `lmcache_blend_lookup_stale_chunks_total` | Counter | `CB_LOOKUP_END` | `+stale_chunks` |
@@ -494,6 +497,18 @@ rate(lmcache_blend_lookup_hit_tokens_total[5m])
 / rate(lmcache_blend_lookup_requested_tokens_total[5m])
 ```
 
+Under V3 the numerator splits into three disjoint reuse paths that sum to
+`hit_tokens`, each with its own counter, so a dashboard can attribute the hit
+rate: `prefix_hit_tokens` (contiguous prefix, pure load),
+`segmented_prefix_hit_tokens` (post-gap chunks retained at their original
+positions), and `non_prefix_hit_tokens` (cross-context chunks re-RoPE'd into
+place).
+
+**Note on `no_gpu_context`:** V2 zeroes the token counts on this path, V3
+reports the real `requested_tokens`.  So under V3 a server with no registered CB
+KV cache shows a growing denominator and a flat numerator — the hit rate falls
+to 0 and `lookup_no_gpu_context_errors` says why.
+
 ### CB Retrieve Metrics
 
 | OTel metric name | Prometheus name | Type | Source event | Calculation |
@@ -501,8 +516,27 @@ rate(lmcache_blend_lookup_hit_tokens_total[5m])
 | `lmcache_blend.retrieve_requests` | `lmcache_blend_retrieve_requests_total` | Counter | `CB_RETRIEVE_START` | +1 per event |
 | `lmcache_blend.retrieve_chunks` | `lmcache_blend_retrieve_chunks_total` | Counter | `CB_RETRIEVE_START` | `+num_chunks` |
 | `lmcache_blend.retrieve_failures` | `lmcache_blend_retrieve_failures_total` | Counter | `CB_RETRIEVE_END` | +1 when `success=False` |
+| `lmcache_blend.retrieve_noops` | `lmcache_blend_retrieve_noops_total` | Counter | `CB_RETRIEVE_NOOP` | +1 per event, labeled `reason` |
 
 **What it answers:** How often is CB retrieval invoked? How many chunks are retrieved per call? What is the failure rate?
+
+**No-op retrieves are the "CB engaged but was not faster" signal.** A no-op
+returns *success* without scattering anything, so the request silently falls
+back to a full recompute: recall stays correct and no failure counter moves.
+Only `retrieve_noops` distinguishes it from a healthy retrieve.  The `reason`
+label is a fixed code — `already_applied` (the ranges were scattered on an
+earlier call for this worker, benign), `beyond_slot_bound` (every match lay past
+the allocated slots — expect a second retrieve after full block allocation), and
+`no_object_keys` (nothing resolved; not benign).
+
+A no-op returns before the GPU work, so it does **not** increment
+`retrieve_requests`; the two are disjoint and the attempt total is their sum:
+
+```
+rate(lmcache_blend_retrieve_noops_total{reason!="already_applied"}[5m])
+/ (rate(lmcache_blend_retrieve_noops_total[5m])
+   + rate(lmcache_blend_retrieve_requests_total[5m]))
+```
 
 ### CB Store Pre-computed Metrics
 
@@ -532,6 +566,54 @@ rate(lmcache_blend_lookup_hit_tokens_total[5m])
 | `lmcache_blend.chunks_evicted` | `lmcache_blend_chunks_evicted_total` | Counter | `CB_CHUNKS_EVICTED` | `+num_chunks` |
 
 **What it answers:** How many chunks are indexed into the fingerprint table? How many stale entries are evicted?
+
+### CB V3 Phase Metrics
+
+The V3 unified lookup and retrieve are split into legs (see
+[blend_v3_observability.md](blend_v3_observability.md) for the span tree).  Each
+`*_duration` histogram pairs that leg's START/END events by session, so it
+measures the same interval as the same-named trace span — the difference is that
+the histogram is always on, while traces are typically sampled.
+
+| OTel metric name | Prometheus name | Type | Source events | Calculation |
+|---|---|---|---|---|
+| `lmcache_blend.lookup_duration` | `lmcache_blend_lookup_duration_milliseconds` | Histogram | `CB_LOOKUP_START/END` | end − start, ms |
+| `lmcache_blend.fingerprint_match_duration` | `lmcache_blend_fingerprint_match_duration_milliseconds` | Histogram | `CB_FINGERPRINT_MATCH_START/END` | end − start, ms |
+| `lmcache_blend.prefix_lookup_duration` | `lmcache_blend_prefix_lookup_duration_milliseconds` | Histogram | `CB_PREFIX_LOOKUP_START/END` | end − start, ms |
+| `lmcache_blend.coordinator_match_duration` | `lmcache_blend_coordinator_match_duration_milliseconds` | Histogram | `CB_COORDINATOR_MATCH_START/END` | end − start, ms |
+| `lmcache_blend.sparse_prefetch_duration` | `lmcache_blend_sparse_prefetch_duration_milliseconds` | Histogram | `CB_SPARSE_PREFETCH_START/END` | end − start, ms |
+| `lmcache_blend.retrieve_duration` | `lmcache_blend_retrieve_duration_milliseconds` | Histogram | `CB_RETRIEVE_START/END` | end − start, ms |
+| `lmcache_blend.scatter_duration` | `lmcache_blend_scatter_duration_milliseconds` | Histogram | `CB_SCATTER_START/END` | end − start, ms |
+| `lmcache_blend.fingerprint_matches` | `lmcache_blend_fingerprint_matches_total` | Counter | `CB_FINGERPRINT_MATCH_END` | `+matches` |
+| `lmcache_blend.coordinator_matches` | `lmcache_blend_coordinator_matches_total` | Counter | `CB_COORDINATOR_MATCH_END` | `+matches` |
+| `lmcache_blend.coordinator_match_timeouts` | `lmcache_blend_coordinator_match_timeouts_total` | Counter | `CB_COORDINATOR_MATCH_END` | +1 when `timed_out=True` |
+| `lmcache_blend.sparse_prefetch_l2_keys` | `lmcache_blend_sparse_prefetch_l2_keys_total` | Counter | `CB_SPARSE_PREFETCH_START` | `+l2_keys` |
+| `lmcache_blend.sparse_prefetch_found_keys` | `lmcache_blend_sparse_prefetch_found_keys_total` | Counter | `CB_SPARSE_PREFETCH_END` | `+found_keys` |
+| `lmcache_blend.scatter_tokens` | `lmcache_blend_scatter_tokens_total` | Counter | `CB_SCATTER_START` | `+scattered_tokens` |
+| `lmcache_blend.scatter_prefix_chunks` | `lmcache_blend_scatter_prefix_chunks_total` | Counter | `CB_SCATTER_START` | `+n_prefix` |
+| `lmcache_blend.scatter_shifted_chunks` | `lmcache_blend_scatter_shifted_chunks_total` | Counter | `CB_SCATTER_START` | `+n_shifted` |
+| `lmcache_blend.scatter_dropped_chunks` | `lmcache_blend_scatter_dropped_chunks_total` | Counter | `CB_SCATTER_START` | `+dropped` |
+
+**What it answers:** Where does CB lookup latency actually go — the prefix leg,
+the sparse L2 prefetch, the fingerprint match, or poll-wait (`lookup_duration`
+minus the legs)? How much of the retrieve is the GPU scatter? How much reuse is
+re-RoPE'd (`scatter_shifted_chunks`) vs loaded as-is
+(`scatter_prefix_chunks`)? Is the coordinator answering inside its budget
+(`coordinator_match_timeouts`)?
+
+Caveats:
+
+- `lookup_duration` spans the whole non-blocking lookup including the poll waits
+  between re-issues, so it is much larger than the sum of its legs. That gap is
+  the L2-load wait, which is the point.
+- The sparse-prefetch metrics only cover lookups whose prefetch actually read L2
+  (the event pair is skipped when every match is already L1-resident), so
+  `sparse_prefetch_*` denominators are smaller than `lookup_requests`.
+- `found_keys` counts every resident key, `l2_keys` only those needing an L2
+  read; the former is not a subset of the latter, so don't divide them.
+- `retrieve_duration` and `scatter_duration` come from stream callbacks, so they
+  are GPU-accurate; a pair whose ends invert against a CPU timestamp is dropped
+  rather than recorded negative.
 
 ---
 

@@ -139,9 +139,20 @@ class EventType(Enum):
     CB_SCATTER_START = "cb.scatter.start"
     CB_SCATTER_END = "cb.scatter.end"
 
+    # CB V3 retrieve no-op (point event, CPU). The retrieve returned success
+    # without scattering anything, so every match silently degrades to a full
+    # recompute: recall stays correct, only the speedup is gone. Metadata:
+    # ``reason`` (str, a low-cardinality code — safe as a metric attribute) and
+    # ``dropped_matches`` (int).
+    CB_RETRIEVE_NOOP = "cb.retrieve.noop"
+
     # Cache Blending (CB) events — lifecycle sentinels (CPU-synchronous)
     CB_REQUEST_START = "cb.request.start"
     CB_STORE_PRE_COMPUTED_SUBMITTED = "cb.store_pre_computed.submitted"
+    # Metadata: ``instance_id`` (int) and ``expects_store_final`` (bool,
+    # default True). V2 defers the cb.request close until its post-inference
+    # store_final arrives; V3 ends the request at CB_RETRIEVE_END and so
+    # publishes ``expects_store_final=False``.
     CB_RETRIEVE_SUBMITTED = "cb.retrieve.submitted"
     CB_STORE_FINAL_SUBMITTED = "cb.store_final.submitted"
     CB_REQUEST_END = "cb.request.end"
